@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist>
+  <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Need access to Microphone</string>
+    <key>CFBundleExecutable</key>
+    <string>NeuralNote</string>
+    <key>CFBundleIconFile</key>
+    <string>Icon.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.draudio.neuralnote</string>
+    <key>CFBundleName</key>
+    <string>NeuralNote</string>
+    <key>CFBundleDisplayName</key>
+    <string>NeuralNote</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.1.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string></string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>AudioComponents</key>
+    <array>
+      <dict>
+        <key>name</key>
+        <string>Dr. Audio: NeuralNote</string>
+        <key>description</key>
+        <string>NeuralNote</string>
+        <key>factoryFunction</key>
+        <string>NeuralNoteAUFactory</string>
+        <key>manufacturer</key>
+        <string>DrAu</string>
+        <key>type</key>
+        <string>aufx</string>
+        <key>subtype</key>
+        <string>NRNT</string>
+        <key>version</key>
+        <integer>65792</integer>
+        <key>resourceUsage</key>
+        <dict>
+          <key>network.client</key>
+          <true/>
+          <key>temporary-exception.files.all.read-write</key>
+          <true/>
+        </dict>
+      </dict>
+    </array>
+  </dict>
+</plist>
