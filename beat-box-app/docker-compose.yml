@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # Development - No external services needed
+  dev:
+    build:
+      context: ..
+      dockerfile: beat-box-app/Dockerfile.dev
+    working_dir: /app/beat-box-app
+    ports:
+      - "3000:3000"  # React dev server
+      - "3001:3001"  # Node API server
+    volumes:
+      - ../:/app
+      - /app/beat-box-app/backend/node_modules
+      - /app/beat-box-app/frontend/node_modules
+      - ../beat-box-app/backend/uploads:/app/beat-box-app/backend/uploads
+      - ../beat-box-app/backend/midi:/app/beat-box-app/backend/midi
+      - ../build:/app/build  # Mount CLI executable
+    environment:
+      - NODE_ENV=development
+      - CLI_PATH=/app/build/CLI/neuralnote_drums
+    command: sh -c "cd backend && npm run dev & cd ../frontend && npm run dev"
+    stdin_open: true
+    tty: true
+
+  # Production - Requires Backblaze B2
+  prod:
+    build:
+      context: ..
+      dockerfile: beat-box-app/Dockerfile.prod
+    working_dir: /app/beat-box-app/backend
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - CLI_PATH=/usr/local/bin/neuralnote_drums
+      - B2_KEY_ID=${B2_KEY_ID}
+      - B2_APP_KEY=${B2_APP_KEY}
+      - B2_BUCKET_ID=${B2_BUCKET_ID}
+      - B2_BUCKET_NAME=${B2_BUCKET_NAME}
+      - B2_DOWNLOAD_URL=${B2_DOWNLOAD_URL}
+      - B2_UPLOAD_URL=${B2_UPLOAD_URL}
+      - B2_UPLOAD_TOKEN=${B2_UPLOAD_TOKEN}
+    volumes:
+      - ../beat-box-app/backend/beatbox.db:/app/beat-box-app/backend/beatbox.db
+    command: npm start
+    restart: unless-stopped
+
+

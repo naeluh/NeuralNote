@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # Development - No external services needed
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"  # React dev server
+      - "3001:3001"  # Node API server
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - ./uploads:/app/uploads
+      - ./midi:/app/midi
+      - ./build:/app/build  # Mount CLI executable
+    environment:
+      - NODE_ENV=development
+      - CLI_PATH=/app/build/CLI/neuralnote_drums
+    command: npm run dev
+    stdin_open: true
+    tty: true
+
+  # Production - Requires Backblaze B2
+  prod:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - CLI_PATH=/usr/local/bin/neuralnote_drums
+      - B2_KEY_ID=${B2_KEY_ID}
+      - B2_APP_KEY=${B2_APP_KEY}
+      - B2_BUCKET_ID=${B2_BUCKET_ID}
+      - B2_BUCKET_NAME=${B2_BUCKET_NAME}
+      - B2_DOWNLOAD_URL=${B2_DOWNLOAD_URL}
+      - B2_UPLOAD_URL=${B2_UPLOAD_URL}
+      - B2_UPLOAD_TOKEN=${B2_UPLOAD_TOKEN}
+    volumes:
+      - ./beatbox.db:/app/beatbox.db
+    command: npm run prod
+    restart: unless-stopped

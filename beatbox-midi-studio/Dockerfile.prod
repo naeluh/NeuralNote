@@ -1,0 +1,44 @@
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache python3 make g++
+
+# Copy package files
+COPY package*.json ./
+
+# Install all dependencies
+RUN npm install
+
+# Copy source
+COPY . .
+
+# Build React app
+RUN npm run build
+
+# Production stage
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install only production dependencies
+COPY package*.json ./
+RUN npm install --production
+
+# Copy built React app
+COPY --from=builder /app/dist ./dist
+
+# Copy server
+COPY server.js ./
+
+# Copy CLI executable (must be built separately)
+COPY build/CLI/neuralnote_drums /usr/local/bin/neuralnote_drums
+RUN chmod +x /usr/local/bin/neuralnote_drums
+
+# Create directories
+RUN mkdir -p /tmp/uploads /tmp/midi
+
+EXPOSE 3001
+
+CMD ["node", "server.js"]

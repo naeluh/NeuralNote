@@ -304,6 +304,84 @@ if(BUILD_CLI)
     message(STATUS "Convenience symlink: ${CMAKE_BINARY_DIR}/neuralnote")
 endif()
 
+#==============================================================================
+# Drums CLI Executable Target (Beatboxing/Percussion)
+#==============================================================================
+
+if(BUILD_CLI)
+    message(STATUS "Building NeuralNote Drums CLI for percussion transcription")
+
+    # Check for drums CLI source in beat-box-app
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/beat-box-app/cli/neuralnote_drums_cli.cpp")
+        set(DRUMS_CLI_SOURCE "${CMAKE_CURRENT_LIST_DIR}/beat-box-app/cli/neuralnote_drums_cli.cpp")
+        message(STATUS "Using drums CLI from beat-box-app/cli/")
+    else()
+        message(WARNING "Drums CLI source not found at beat-box-app/cli/neuralnote_drums_cli.cpp")
+    endif()
+
+    if(DRUMS_CLI_SOURCE)
+        set(DRUMS_CLI_SOURCES
+            ${DRUMS_CLI_SOURCE}
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Model/Features.cpp
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Model/BasicPitch.cpp
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Model/Notes.cpp
+        )
+
+        add_executable(neuralnote_drums_cli ${DRUMS_CLI_SOURCES})
+
+        set_target_properties(neuralnote_drums_cli PROPERTIES
+            OUTPUT_NAME "neuralnote_drums"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/CLI"
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED ON
+        )
+
+        target_include_directories(neuralnote_drums_cli PRIVATE
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Model
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Utils
+            ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/onnxruntime/include
+            ${CMAKE_BINARY_DIR}/${BaseTargetName}_artefacts/JuceLibraryCode
+            ${CMAKE_BINARY_DIR}/juce_binarydata_bin_data/JuceLibraryCode
+        )
+
+        target_link_libraries(neuralnote_drums_cli PRIVATE
+            juce::juce_core
+            juce::juce_audio_basics
+            juce::juce_audio_formats
+            juce::juce_events
+            juce::juce_graphics
+            onnxruntime
+            bin_data
+            BasicPitchCNN
+            RTNeural
+        )
+
+        if(APPLE)
+            target_link_libraries(neuralnote_drums_cli PRIVATE
+                "-framework Foundation"
+                "-framework Accelerate"
+                "-framework CoreAudio"
+            )
+            if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+                target_compile_options(neuralnote_drums_cli PRIVATE -march=native -O3)
+            endif()
+            set_target_properties(neuralnote_drums_cli PROPERTIES
+                MACOSX_DEPLOYMENT_TARGET "10.15"
+            )
+        endif()
+
+        target_compile_definitions(neuralnote_drums_cli PRIVATE
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            CLI_BUILD=1
+        )
+
+        add_dependencies(neuralnote_drums_cli ${BaseTargetName} bin_data)
+
+        message(STATUS "Drums CLI: ${CMAKE_BINARY_DIR}/CLI/neuralnote_drums")
+    endif()
+endif()
+
 # Unit tests (if enabled)
 if (BUILD_UNIT_TESTS)
     add_subdirectory(Tests)

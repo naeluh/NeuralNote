@@ -1,6 +1,7 @@
 /*
   NeuralNote CLI - Complete Working Version with All Parameters
   Matches GUI behavior with proper MIDI output
+  ./build/CLI/neuralnote -i long_wav.wav -o piano_more_test.mid -f midi -v --no-auto --note-sens 0.8 --split-sens 0.8 --threshold 0.05 --min-duration 25
 */
 
 #include <juce_core/juce_core.h>
@@ -15,6 +16,8 @@
 #include "Features.h"
 #include "BasicPitch.h"
 #include "Notes.h"
+#include "NoteOptions.h"
+#include "BasicPitchConstants.h"
 
 struct NoteEvent {
     float startTime;
@@ -35,15 +38,25 @@ struct CLIArgs {
     bool autoAnalyze = true;
     bool showAnalysis = false;
     juce::String format = "json";
+    
+    // Music theory and accuracy improvements
+    bool enableNoteQuantization = false;
+    int keyRootNote = 0; // C = 0, C# = 1, etc.
+    int scaleType = 0; // Chromatic = 0, Major = 1, Minor = 2, etc.
+    int snapMode = 0; // Adjust = 0, Remove = 1
+    int minMidiNote = MIN_MIDI_NOTE; // A0
+    int maxMidiNote = MAX_MIDI_NOTE; // C8
+    bool mergeOverlappingNotes = true;
+    bool dropOverlappingPitchBends = true;
 };
 
 void printUsage(const char* programName)
 {
     std::cout << "NeuralNote CLI - Smart Audio-to-MIDI Transcription\n";
-    std::cout << "Automatically analyzes audio and optimizes parameters for best results\n\n";
+    std::cout << "Enhanced with music theory and MIDI standards for improved accuracy\n\n";
     std::cout << "Usage: " << programName << " [options] -i <input_file> -o <output_file>\n\n";
     std::cout << "Options:\n";
-    std::cout << "  -i, --input <file>     Input audio file (.wav, .aiff, .flac)\n";
+    std::cout << "  -i, --input <file>     Input audio file (.wav, .aiff, .flac, .mp3)\n";
     std::cout << "  -o, --output <file>    Output file\n";
     std::cout << "  -f, --format <format>  Output format: json, midi, csv (default: json)\n";
     std::cout << "  --auto-analyze         Auto-detect optimal parameters (default: on)\n";
@@ -55,13 +68,22 @@ void printUsage(const char* programName)
     std::cout << "  -d, --min-duration <ms> Minimum note duration in ms\n";
     std::cout << "  -t, --threshold <val>  Amplitude threshold 0.0-1.0\n";
     std::cout << "  -r, --sample-rate <hz> Sample rate (default: 22050)\n";
+    std::cout << "\nMusic Theory & Accuracy Improvements:\n";
+    std::cout << "  --enable-note-quant    Enable note quantization to musical scales\n";
+    std::cout << "  --key-root <note>      Root note (0=C, 1=C#, 2=D, ..., 11=B)\n";
+    std::cout << "  --scale <type>         Scale type (0=Chromatic, 1=Major, 2=Minor, 3=Dorian, etc.)\n";
+    std::cout << "  --snap-mode <mode>     Snap mode (0=Adjust, 1=Remove)\n";
+    std::cout << "  --min-midi <note>      Minimum MIDI note (default: 21=A0)\n";
+    std::cout << "  --max-midi <note>      Maximum MIDI note (default: 108=C8)\n";
+    std::cout << "  --no-merge-notes      Disable merging overlapping notes\n";
+    std::cout << "  --no-drop-bends       Disable dropping overlapping pitch bends\n";
     std::cout << "\nOther:\n";
     std::cout << "  -v, --verbose          Verbose output\n";
     std::cout << "  -h, --help             Show this help\n\n";
     std::cout << "Examples:\n";
-    std::cout << "  " << programName << " -i piano.wav -o piano.mid    # Auto-optimized\n";
-    std::cout << "  " << programName << " -i drums.wav -o drums.json --show-analysis\n";
-    std::cout << "  " << programName << " -i song.wav -o song.mid --no-auto -n 0.3 -s 0.4\n";
+    std::cout << "  " << programName << " -i piano.wav -o piano.mid --enable-note-quant --key-root 0 --scale 1\n";
+    std::cout << "  " << programName << " -i song.mp3 -o song.mid --enable-note-quant --scale 2 --snap-mode 0\n";
+    std::cout << "  " << programName << " -i beatbox.wav -o beatbox.mid --enable-note-quant --scale 2 --snap-mode 0\n";
 }
 
 CLIArgs parseArgs(int argc, char* argv[])
@@ -101,6 +123,22 @@ CLIArgs parseArgs(int argc, char* argv[])
             args.autoAnalyze = false; // Manual override
         } else if (arg == "-v" || arg == "--verbose") {
             args.verbose = true;
+        } else if (arg == "--enable-note-quant") {
+            args.enableNoteQuantization = true;
+        } else if ((arg == "--key-root") && i + 1 < argc) {
+            args.keyRootNote = juce::String(argv[++i]).getIntValue();
+        } else if ((arg == "--scale") && i + 1 < argc) {
+            args.scaleType = juce::String(argv[++i]).getIntValue();
+        } else if ((arg == "--snap-mode") && i + 1 < argc) {
+            args.snapMode = juce::String(argv[++i]).getIntValue();
+        } else if ((arg == "--min-midi") && i + 1 < argc) {
+            args.minMidiNote = juce::String(argv[++i]).getIntValue();
+        } else if ((arg == "--max-midi") && i + 1 < argc) {
+            args.maxMidiNote = juce::String(argv[++i]).getIntValue();
+        } else if (arg == "--no-merge-notes") {
+            args.mergeOverlappingNotes = false;
+        } else if (arg == "--no-drop-bends") {
+            args.dropOverlappingPitchBends = false;
         } else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             printUsage(argv[0]);
@@ -313,6 +351,14 @@ juce::Array<NoteEvent> transcribe(const juce::AudioBuffer<float>& audio, const C
         std::cout << "  Split sensitivity: " << splitSens << "\n";
         std::cout << "  Min duration: " << minDuration << " ms\n";
         std::cout << "  Amplitude threshold: " << args.amplitudeThreshold << "\n";
+        
+        if (args.enableNoteQuantization) {
+            std::cout << "  Note quantization: ENABLED\n";
+            std::cout << "    Key root: " << args.keyRootNote << "\n";
+            std::cout << "    Scale type: " << args.scaleType << "\n";
+            std::cout << "    Snap mode: " << args.snapMode << "\n";
+            std::cout << "    MIDI range: " << args.minMidiNote << "-" << args.maxMidiNote << "\n";
+        }
     }
 
     // Set BasicPitch parameters
@@ -330,10 +376,39 @@ juce::Array<NoteEvent> transcribe(const juce::AudioBuffer<float>& audio, const C
     basicPitch.transcribeToMIDI(const_cast<float*>(audioData), numSamples);
 
     // Get results
-    const auto& noteEvents = basicPitch.getNoteEvents();
+    auto noteEvents = basicPitch.getNoteEvents();
 
     if (args.verbose) {
         std::cout << "Raw note events found: " << noteEvents.size() << "\n";
+    }
+
+    // Apply music theory improvements
+    if (args.enableNoteQuantization) {
+        NoteOptions noteOptions;
+        noteOptions.setParameters(
+            true, // Enable
+            static_cast<NoteUtils::RootNote>(args.keyRootNote),
+            static_cast<NoteUtils::ScaleType>(args.scaleType),
+            static_cast<NoteUtils::SnapMode>(args.snapMode),
+            args.minMidiNote,
+            args.maxMidiNote
+        );
+        
+        noteEvents = noteOptions.process(noteEvents);
+        
+        if (args.verbose) {
+            std::cout << "After note quantization: " << noteEvents.size() << " notes\n";
+        }
+    }
+
+
+    // Apply post-processing
+    if (args.dropOverlappingPitchBends) {
+        Notes::dropOverlappingPitchBends(noteEvents);
+    }
+    
+    if (args.mergeOverlappingNotes) {
+        Notes::mergeOverlappingNotesWithSamePitch(noteEvents);
     }
 
     // Convert to our format with user-specified filtering
@@ -342,7 +417,7 @@ juce::Array<NoteEvent> transcribe(const juce::AudioBuffer<float>& audio, const C
 
     // DEBUG: Show raw timing from BasicPitch before any conversion
     if (args.verbose && noteEvents.size() > 0) {
-        std::cout << "DEBUG RAW: First few raw BasicPitch note events:\n";
+        std::cout << "DEBUG RAW: First few processed note events:\n";
         for (int i = 0; i < std::min(5, (int) noteEvents.size()); ++i) {
             const auto& event = noteEvents[i];
             std::cout << "DEBUG RAW: Event " << i << " - Pitch: " << event.pitch << ", Start: " << event.startTime
@@ -362,6 +437,12 @@ juce::Array<NoteEvent> transcribe(const juce::AudioBuffer<float>& audio, const C
         // Check minimum duration
         float durationMs = (event.endTime - event.startTime) * 1000.0f;
         if (durationMs < args.minNoteDuration) {
+            filteredCount++;
+            continue;
+        }
+
+        // Apply MIDI note range filtering
+        if (event.pitch < args.minMidiNote || event.pitch > args.maxMidiNote) {
             filteredCount++;
             continue;
         }

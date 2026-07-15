@@ -1,0 +1,26 @@
+{
+  "name": "beat-box-app-backend",
+  "version": "1.0.0",
+  "description": "Backend server for Beat Box App - Beatboxing to MIDI conversion",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development nodemon server.js",
+    "test": "node test-pipeline.js"
+  },
+  "dependencies": {
+    "@tonejs/midi": "^2.0.28",
+    "backblaze-b2": "^1.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

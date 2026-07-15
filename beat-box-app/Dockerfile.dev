@@ -1,0 +1,25 @@
+FROM node:20-alpine
+
+WORKDIR /app/beat-box-app
+
+# Install dependencies for both backend and frontend
+RUN apk add --no-cache python3 make g++
+
+# Copy and install backend dependencies
+COPY beat-box-app/backend/package*.json ./backend/
+RUN cd backend && npm install
+
+# Copy and install frontend dependencies
+COPY beat-box-app/frontend/package*.json ./frontend/
+RUN cd frontend && npm install
+
+# Copy source files
+COPY beat-box-app/backend ./backend
+COPY beat-box-app/frontend ./frontend
+
+# Expose ports
+EXPOSE 3000 3001
+
+CMD ["sh", "-c", "cd backend && npm run dev & cd ../frontend && npm run dev"]
+
+

@@ -3,6 +3,14 @@
 //
 
 #include "BasicPitch.h"
+#include <stdexcept>
+#include <iostream>
+#include <algorithm>
+
+#if SAVE_DOWNSAMPLED_AUDIO
+#include <juce_audio_formats/juce_audio_formats.h>
+#include <juce_audio_basics/juce_audio_basics.h>
+#endif
 
 void BasicPitch::reset()
 {
@@ -23,8 +31,13 @@ void BasicPitch::reset()
 
 void BasicPitch::setParameters(float inNoteSensitivity, float inSplitSensitivity, float inMinNoteDurationMs)
 {
-    mParams.frameThreshold = 1.0f - inNoteSensitivity;
-    mParams.onsetThreshold = 1.0f - inSplitSensitivity;
+    // Invert: High sensitivity (0.9) → Low threshold (0.1) = more notes detected
+    // Clamp to valid range [0.05, 0.95] to prevent negative thresholds
+    float clampedNoteSens = std::max(0.05f, std::min(0.95f, inNoteSensitivity));
+    float clampedSplitSens = std::max(0.05f, std::min(0.95f, inSplitSensitivity));
+
+    mParams.frameThreshold = 1.0f - clampedNoteSens;
+    mParams.onsetThreshold = 1.0f - clampedSplitSens;
 
     mParams.minNoteLength =
         static_cast<int>(std::round(inMinNoteDurationMs / 1000.0f / (FFT_HOP / BASIC_PITCH_SAMPLE_RATE)));
@@ -57,6 +70,12 @@ void BasicPitch::transcribeToMIDI(float* inAudio, int inNumSamples)
 #endif
 
     const float* stacked_cqt = mFeaturesCalculator.computeFeatures(inAudio, inNumSamples, mNumFrames);
+
+    // Debug: Check if computeFeatures returned 0 frames
+    if (mNumFrames == 0) {
+        // This will be caught by the try-catch in the CLI
+        throw std::runtime_error("ONNX model returned 0 frames. Check model input/output shapes.");
+    }
 
     mOnsetsPG.resize(mNumFrames, std::vector<float>(static_cast<size_t>(NUM_FREQ_OUT), 0.0f));
     mNotesPG.resize(mNumFrames, std::vector<float>(static_cast<size_t>(NUM_FREQ_OUT), 0.0f));
@@ -99,7 +118,36 @@ void BasicPitch::transcribeToMIDI(float* inAudio, int inNumSamples)
                                       mOnsetsPG[frame_idx - num_lh_frames]);
     }
 
+    // DEBUG: Check posteriorgrams before conversion
+    std::cout << "DEBUG: Features computed successfully\n";
+    std::cout << "DEBUG: mNumFrames = " << mNumFrames << "\n";
+    std::cout << "DEBUG: Posteriorgram sizes: contours=" << mContoursPG.size()
+              << ", notes=" << mNotesPG.size()
+              << ", onsets=" << mOnsetsPG.size() << "\n";
+
+    // Check if posteriorgrams have data
+    if (mNumFrames > 0 && !mNotesPG.empty() && !mNotesPG[0].empty()) {
+        float maxNote = 0, maxOnset = 0, maxContour = 0;
+        for (size_t i = 0; i < mNotesPG.size(); i++) {
+            for (size_t j = 0; j < mNotesPG[i].size(); j++) {
+                maxNote = std::max(maxNote, mNotesPG[i][j]);
+                maxOnset = std::max(maxOnset, mOnsetsPG[i][j]);
+                maxContour = std::max(maxContour, mContoursPG[i][j]);
+            }
+        }
+        std::cout << "DEBUG: Max values - Note: " << maxNote
+                  << ", Onset: " << maxOnset
+                  << ", Contour: " << maxContour << "\n";
+    }
+
+    std::cout << "DEBUG: Calling Notes::convert with frameThreshold="
+              << mParams.frameThreshold
+              << ", onsetThreshold=" << mParams.onsetThreshold
+              << ", minNoteLength=" << mParams.minNoteLength << "\n";
+
     mNoteEvents = mNotesCreator.convert(mNotesPG, mOnsetsPG, mContoursPG, mParams, true);
+
+    std::cout << "DEBUG: Notes::convert returned " << mNoteEvents.size() << " events\n";
 }
 
 void BasicPitch::updateMIDI()

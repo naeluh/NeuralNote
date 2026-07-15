@@ -1,0 +1,46 @@
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /app/beat-box-app/frontend
+
+# Install build dependencies
+RUN apk add --no-cache python3 make g++
+
+# Copy and install frontend dependencies
+COPY beat-box-app/frontend/package*.json ./
+RUN npm install
+
+# Copy frontend source
+COPY beat-box-app/frontend ./
+
+# Build React app
+RUN npm run build
+
+# Production stage
+FROM node:20-alpine
+
+WORKDIR /app/beat-box-app/backend
+
+# Install only production dependencies
+COPY beat-box-app/backend/package*.json ./
+RUN npm install --production
+
+# Copy built React app from builder
+COPY --from=frontend-builder /app/beat-box-app/frontend/dist ../frontend/dist
+
+# Copy backend server
+COPY beat-box-app/backend/server.js ./
+COPY beat-box-app/backend/drums-cli-wrapper.js ./
+
+# Copy CLI executable (must be built separately from main project)
+# Assumes CLI is at ../../build/CLI/neuralnote_drums relative to beat-box-app
+COPY build/CLI/neuralnote_drums /usr/local/bin/neuralnote_drums
+RUN chmod +x /usr/local/bin/neuralnote_drums
+
+# Create directories
+RUN mkdir -p /tmp/uploads /tmp/midi
+
+EXPOSE 3001
+
+CMD ["node", "server.js"]
+
+

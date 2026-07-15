@@ -3,6 +3,8 @@
 //
 
 #include "Features.h"
+#include <stdexcept>
+#include <string>
 
 Features::Features()
     : mMemoryInfo(nullptr)
@@ -29,9 +31,26 @@ const float* Features::computeFeatures(float* inAudio, size_t inNumSamples, size
     mOutput = mSession.Run(mRunOptions, mInputNames, mInput.data(), 1, mOutputNames, 1);
 
     auto out_shape = mOutput[0].GetTensorTypeAndShapeInfo().GetShape();
-    assert(out_shape[0] == 1 && out_shape[2] == NUM_FREQ_IN && out_shape[3] == NUM_HARMONICS);
+
+    // Check output shape validity (replace assert with runtime check)
+    if (out_shape[0] != 1 || out_shape[2] != NUM_FREQ_IN || out_shape[3] != NUM_HARMONICS) {
+        throw std::runtime_error(
+            "ONNX model output shape mismatch. Expected [1, N, " +
+            std::to_string(NUM_FREQ_IN) + ", " + std::to_string(NUM_HARMONICS) +
+            "], got [" + std::to_string(out_shape[0]) + ", " + std::to_string(out_shape[1]) +
+            ", " + std::to_string(out_shape[2]) + ", " + std::to_string(out_shape[3]) + "]"
+        );
+    }
 
     outNumFrames = static_cast<size_t>(out_shape[1]);
+
+    // Check if we got 0 frames (this would cause empty results)
+    if (outNumFrames == 0) {
+        throw std::runtime_error(
+            "ONNX model returned 0 frames. Input samples: " + std::to_string(inNumSamples) +
+            ". Model may not be processing the audio correctly."
+        );
+    }
 
     mInput.clear();
 
