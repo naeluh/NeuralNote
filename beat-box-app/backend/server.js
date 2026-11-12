@@ -4,17 +4,26 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { spawn, exec } = require('child_process');
+const crypto = require('crypto');
+const { execFile } = require('child_process');
 const { promisify } = require('util');
-const execPromise = promisify(exec);
+const execFileP = promisify(execFile);
 const { DatabaseSync: Database } = require('node:sqlite');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// Tests point this at a temp dir so they never touch real recordings.
+const DATA_DIR = process.env.BEATBOX_DATA_DIR;
 
 // Initialize SQLite database (KV store)
-const db = new Database(IS_PRODUCTION ? 'beatbox.db' : 'beatbox-dev.db');
+const db = new Database(
+  DATA_DIR
+    ? path.join(DATA_DIR, 'beatbox.db')
+    : IS_PRODUCTION
+    ? 'beatbox.db'
+    : 'beatbox-dev.db'
+);
 db.exec(`
   CREATE TABLE IF NOT EXISTS recordings (
     id TEXT PRIMARY KEY,
@@ -38,57 +47,199 @@ if (IS_PRODUCTION) {
 }
 
 // Storage configuration - relative to backend directory
-const UPLOAD_DIR = IS_PRODUCTION
-  ? '/tmp/uploads'
-  : path.join(__dirname, 'uploads');
-const MIDI_DIR = IS_PRODUCTION ? '/tmp/midi' : path.join(__dirname, 'midi');
-// CLI path relative to backend directory: ../CLI/neuralnote_drums
+const STORAGE_ROOT = DATA_DIR || (IS_PRODUCTION ? '/tmp' : __dirname);
+const UPLOAD_DIR = path.join(STORAGE_ROOT, 'uploads');
+const MIDI_DIR = path.join(STORAGE_ROOT, 'midi');
+// CLI path relative to backend directory: ../cli/neuralnote_drums
 const CLI_PATH =
-  process.env.CLI_PATH || path.join(__dirname, '../CLI/neuralnote_drums');
+  process.env.CLI_PATH || path.join(__dirname, '../cli/neuralnote_drums');
 
-// Ensure directories exist
-[UPLOAD_DIR, MIDI_DIR].forEach((dir) => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
+[UPLOAD_DIR, MIDI_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
 
-// Multer configuration
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    // Always save uploads as .webm since browser MediaRecorder outputs WebM
-    const uniqueName = `${Date.now()}-${Math.random()
-      .toString(36)
-      .substr(2, 9)}.webm`;
-    cb(null, uniqueName);
+// Recordings are 10 s; uploads can be anything, so only the start is used.
+const MAX_AUDIO_SECONDS = 30;
+// The shortest stretch of audio a trim may keep.
+const MIN_TRIM_SECONDS = 0.5;
+// Edited hits: the CLI's own limits (64 bars at 480 ticks per quarter note).
+const MAX_NOTES = 1500;
+const MAX_NOTE_TICK = 64 * 4 * 480;
+// ffmpeg and the CLI both finish a 30 s clip in about a second.
+const CHILD_TIMEOUT_MS = 60_000;
+
+/**
+ * Error carrying the HTTP status the JSON error middleware should answer with.
+ * @param {number} status
+ * @param {string} message
+ * @returns {Error & {status: number}}
+ */
+const httpError = (status, message) =>
+  Object.assign(new Error(message), { status });
+
+/**
+ * Forward async route rejections to the error middleware (Express 4 does not).
+ * @param {(req: import('express').Request, res: import('express').Response) => Promise<unknown>} fn
+ * @returns {import('express').RequestHandler}
+ */
+const route = (fn) => (req, res, next) => fn(req, res).catch(next);
+
+/**
+ * Run `work`, then delete this request's scratch files, and only then hand the
+ * result back to be sent. Answering first let a fast client see the leftovers.
+ * @template T
+ * @param {(string|undefined)[]} scratchPaths
+ * @param {() => Promise<T>} work
+ * @returns {Promise<T>}
+ */
+async function thenCleanUp(scratchPaths, work) {
+  try {
+    return await work();
+  } finally {
+    for (const file of scratchPaths) {
+      if (file) await fs.promises.rm(file, { force: true });
+    }
   }
-});
+}
 
 const upload = multer({
-  storage,
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    // ffmpeg probes content, so the extension is only a label
+    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}.upload`)
+  }),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
   fileFilter: (req, file, cb) => {
-    // Accept audio files including WebM
     if (file.mimetype.startsWith('audio/') || file.mimetype === 'video/webm') {
       cb(null, true);
     } else {
-      cb(new Error('Only audio files allowed'));
+      cb(httpError(400, 'Only audio files allowed'));
     }
   }
 });
 
 const DrumsCLI = require('./drums-cli-wrapper');
-const {
-  convertMidiToStrudelPattern,
-  parseMidiToDrumEvents
-} = require('./services/midiToStrudel');
-const { v4: uuid } = require('uuid');
+const { convertMidiToStrudelPattern } = require('./services/midiToStrudel');
+const kitStore = require('./services/kit');
 
-// Initialize CLI wrapper with correct path
+// Sounds the user taught; the CLI reads this file directly in kit mode
+const KIT_PATH = path.join(STORAGE_ROOT, 'data', 'kit.json');
+// Trained network for neural mode; ships next to the CLI
+const MODEL_PATH =
+  process.env.MODEL_PATH || path.join(path.dirname(CLI_PATH), 'drum_model.json');
+
 const drumsCLI = new DrumsCLI(CLI_PATH);
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+/**
+ * Convert any browser recording to what the CLI's detector is tuned for:
+ * 22050 Hz mono 16-bit WAV. Only the first MAX_AUDIO_SECONDS are kept, so an
+ * uploaded song cannot turn into an 80-bar pattern.
+ * @param {string} inputPath
+ * @param {string} wavPath
+ * @param {{start?: number, end?: number}} [trim] - seconds of the input to keep; default: from the start
+ * @returns {Promise<void>}
+ */
+async function toWav(inputPath, wavPath, { start = 0, end } = {}) {
+  // One -t, as a length: after an output-side -ss, "-to" would count from the cut, not the file
+  const seconds = Math.min(end === undefined ? MAX_AUDIO_SECONDS : end - start, MAX_AUDIO_SECONDS);
+  try {
+    await execFileP(
+      'ffmpeg',
+      [
+        '-y', '-i', inputPath,
+        ...(start > 0 ? ['-ss', String(start)] : []),
+        '-t', String(seconds), '-ar', '22050', '-ac', '1', '-sample_fmt', 's16', wavPath
+      ],
+      { timeout: CHILD_TIMEOUT_MS, killSignal: 'SIGKILL' }
+    );
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      throw httpError(500, 'ffmpeg is not installed on the server');
+    }
+    if (err.killed) {
+      throw httpError(504, 'Converting that audio took too long. Try a shorter clip.');
+    }
+    throw httpError(400, "That audio couldn't be read. Try again, or use a different file.");
+  }
+}
+
+/**
+ * Parse and validate one numeric form field.
+ * @param {unknown} raw
+ * @param {{name: string, min: number, max: number, fallback: number}} spec
+ * @returns {number}
+ */
+function numberParam(raw, { name, min, max, fallback }) {
+  const value = raw === undefined || raw === '' ? fallback : Number(raw);
+  if (!(value >= min && value <= max)) {
+    throw httpError(400, `Invalid ${name}: must be ${min}-${max}`);
+  }
+  return value;
+}
+
+/**
+ * Detection parameters shared by every route that runs the CLI.
+ * @param {Record<string, unknown>} body
+ * @returns {{sensitivity: number, threshold: number, bpm: number|'auto', quantize: 0|16, mode: 'classic'|'kit'|'neural', kitPath?: string, modelPath?: string, trim: {start: number, end?: number}}}
+ */
+function detectionParams(body) {
+  const trimStart = numberParam(body.trimStart, { name: 'trimStart', min: 0, max: 600, fallback: 0 });
+  const trimEnd =
+    body.trimEnd === undefined || body.trimEnd === ''
+      ? undefined
+      : numberParam(body.trimEnd, { name: 'trimEnd', min: 0, max: 600, fallback: 0 });
+  // 1e-6: a handle parked exactly MIN_TRIM_SECONDS away must not fail on float rounding
+  if (trimEnd !== undefined && trimEnd - trimStart < MIN_TRIM_SECONDS - 1e-6) {
+    throw httpError(400, `Invalid trim: keep at least ${MIN_TRIM_SECONDS} s of audio`);
+  }
+  const auto = body.bpm === undefined || body.bpm === '' || body.bpm === 'auto';
+  if (!['0', '16', undefined].includes(body.quantize)) {
+    throw httpError(400, 'Invalid quantize: must be 0 or 16');
+  }
+  const mode = body.mode === undefined || body.mode === '' ? 'classic' : body.mode;
+  if (!['classic', 'kit', 'neural'].includes(mode)) {
+    throw httpError(400, 'Invalid mode: must be classic, kit or neural');
+  }
+  if (mode === 'neural' && !fs.existsSync(MODEL_PATH)) {
+    throw httpError(400, 'The neural model is not installed on this server. Use Classic or My Kit.');
+  }
+  if (mode === 'kit' && kitStore.listSounds(KIT_PATH).length === 0) {
+    throw httpError(400, 'Your kit is empty. Teach at least one sound first, or switch to Classic.');
+  }
+  return {
+    mode,
+    kitPath: mode === 'kit' ? KIT_PATH : undefined,
+    modelPath: mode === 'neural' ? MODEL_PATH : undefined,
+    sensitivity: numberParam(body.sensitivity, { name: 'sensitivity', min: 0, max: 1, fallback: 0.5 }),
+    threshold: numberParam(body.threshold, { name: 'threshold', min: 0, max: 1, fallback: 0 }),
+    bpm: auto ? 'auto' : Math.round(numberParam(body.bpm, { name: 'BPM', min: 60, max: 300, fallback: 120 })),
+    quantize: body.quantize === '0' ? 0 : 16,
+    trim: { start: trimStart, end: trimEnd }
+  };
+}
+
+/**
+ * Hits the user edited, validated to the limits the CLI enforces.
+ * @param {unknown} body - JSON request body
+ * @returns {{bpm: number, notes: {tick: number, note: number, velocity: number}[]}}
+ */
+function notesParams(body) {
+  const bpm = numberParam(body?.bpm, { name: 'BPM', min: 60, max: 300, fallback: NaN });
+  if (!Number.isInteger(bpm)) throw httpError(400, 'Invalid BPM: must be a whole number');
+  const notes = body.notes;
+  if (!Array.isArray(notes) || notes.length === 0 || notes.length > MAX_NOTES) {
+    throw httpError(400, `Invalid notes: send 1-${MAX_NOTES} hits`);
+  }
+  const whole = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
+  for (const hit of notes) {
+    if (!hit || !whole(hit.tick, 0, MAX_NOTE_TICK) || !whole(hit.note, 35, 81) || !whole(hit.velocity, 1, 127)) {
+      throw httpError(400, `Invalid notes: each hit needs tick 0-${MAX_NOTE_TICK}, note 35-81 and velocity 1-127`);
+    }
+  }
+  return { bpm, notes: notes.map(({ tick, note, velocity }) => ({ tick, note, velocity })) };
+}
 
 // Health check
 app.get('/api/health', async (req, res) => {
@@ -104,373 +255,113 @@ app.get('/api/health', async (req, res) => {
     mode: IS_PRODUCTION ? 'production' : 'development',
     storage: IS_PRODUCTION ? 'backblaze-b2' : 'local-filesystem',
     cli_available: cliInfo.available,
-    cli_path: CLI_PATH
+    cli_path: CLI_PATH,
+    neural_available: fs.existsSync(MODEL_PATH),
+    kit_sounds: kitStore.listSounds(KIT_PATH).length
   });
 });
 
-// Upload and process beatbox recording
-app.post('/api/upload', upload.single('audio'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No audio file provided' });
-    }
+// Process a recording: audio in, MIDI file + Strudel preview pattern out
+app.post(
+  '/api/process',
+  upload.single('audio'),
+  route(async (req, res) => {
+    const id = crypto.randomUUID();
+    const wavPath = path.join(UPLOAD_DIR, `${id}.wav`);
+    const midiPath = path.join(MIDI_DIR, `${id}.mid`);
 
-    // Validate request body parameters
-    const sensitivity = parseFloat(req.body.sensitivity);
-    const threshold = parseFloat(req.body.threshold);
-    const bpm = parseInt(req.body.bpm);
-
-    if (isNaN(sensitivity) || sensitivity < 0 || sensitivity > 1) {
-      return res
-        .status(400)
-        .json({ error: 'Invalid sensitivity: must be 0.0-1.0' });
-    }
-    if (isNaN(threshold) || threshold < 0 || threshold > 1) {
-      return res
-        .status(400)
-        .json({ error: 'Invalid threshold: must be 0.0-1.0' });
-    }
-    if (isNaN(bpm) || bpm < 60 || bpm > 300) {
-      return res.status(400).json({ error: 'Invalid BPM: must be 60-300' });
-    }
-
-    const recordingId =
-      req.body.recordingId || path.basename(req.file.filename, '.webm');
-    const uploadedPath = req.file.path; // This will be .webm
-    const wavPath = path.join(UPLOAD_DIR, `${recordingId}.wav`);
-    const midiPath = path.join(MIDI_DIR, `${recordingId}.mid`);
-
-    // Log what we received
-    console.log(`Received upload: ${req.file.filename}`);
-    console.log(`  MIME type: ${req.file.mimetype}`);
-    console.log(`  Size: ${req.file.size} bytes`);
-
-    // ALWAYS convert WebM to WAV
-    console.log(`Converting WebM to WAV: ${recordingId}`);
-    const uploadStats = await fs.promises.stat(uploadedPath);
-    console.log(`  Input: ${uploadedPath} (${uploadStats.size} bytes)`);
-    console.log(`  Output: ${wavPath}`);
-
-    // Convert WebM to WAV using ffmpeg directly
-    // -f wav: WAV format
-    // -acodec pcm_s16le: PCM 16-bit little-endian (standard WAV)
-    // -ar 48000: 48kHz sample rate
-    // -ac 1: Mono channel
-    // -y: Overwrite output file
-    const ffmpegCmd = `ffmpeg -i "${uploadedPath}" -f wav -acodec pcm_s16le -ar 48000 -ac 1 -y "${wavPath}"`;
-
-    try {
-      const { stdout, stderr } = await execPromise(ffmpegCmd);
-      if (stderr) {
-        console.log('FFmpeg output:', stderr);
+    // Only the MIDI is kept; the upload and its WAV are scratch files
+    const body = await thenCleanUp([wavPath, req.file?.path], async () => {
+      if (!req.file) throw httpError(400, 'No audio file provided');
+      const params = detectionParams(req.body);
+      if (req.file.size < 1000) {
+        throw httpError(400, `That audio is too short to use (${req.file.size} bytes). Try again.`);
       }
 
-      // Verify the converted file exists and has content
-      const stats = await fs.promises.stat(wavPath);
-      if (stats.size === 0) {
-        throw new Error('Converted WAV file is empty');
+      await toWav(req.file.path, wavPath, params.trim);
+      // ffmpeg succeeds with an empty file when the trim starts past the end of the audio
+      const trimmed = params.trim.start > 0 || params.trim.end !== undefined;
+      const wavBytes = fs.existsSync(wavPath) ? fs.statSync(wavPath).size : 0;
+      if (trimmed && wavBytes < 44 + 0.4 * 22050 * 2) {
+        throw httpError(400, 'That trim leaves no audio. Widen it and try again.');
       }
-      console.log(
-        `Conversion successful: ${recordingId} (${stats.size} bytes)`
-      );
+      const cliResult = await drumsCLI.convert(wavPath, midiPath, params);
 
-      // Delete the original WebM file
+      if (cliResult.drumCount === 0) {
+        return {
+          success: false,
+          drumCount: 0,
+          error: 'No drum hits detected. Try beatboxing louder or raising sensitivity.'
+        };
+      }
+
+      const { strudelPattern, drumEvents } = await convertMidiToStrudelPattern(midiPath, cliResult.bpm);
+
+      // History row; the app works without it
       try {
-        await fs.promises.unlink(uploadedPath);
-        console.log(`Deleted temp file: ${uploadedPath}`);
-      } catch (unlinkError) {
-        console.warn('Could not delete temp file:', unlinkError);
+        db.prepare(
+          `INSERT INTO recordings (id, filename, storage_path, midi_path, created_at, drum_count)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(id, req.file.originalname || 'beatbox.webm', wavPath, midiPath, Date.now(), cliResult.drumCount);
+      } catch (dbError) {
+        console.warn('Database save failed:', dbError);
       }
-    } catch (ffmpegError) {
-      console.error('FFmpeg conversion error:', ffmpegError);
-      console.error('  Command:', ffmpegCmd);
-      console.error('  stdout:', ffmpegError.stdout);
-      console.error('  stderr:', ffmpegError.stderr);
-      throw new Error(`Audio conversion failed: ${ffmpegError.message}`);
-    }
 
-    // Verify WAV file exists before processing
-    try {
-      const stats = await fs.promises.stat(wavPath);
-      console.log(`WAV file ready: ${wavPath} (${stats.size} bytes)`);
-    } catch (statError) {
-      throw new Error(`WAV file not found after conversion: ${wavPath}`);
-    }
-
-    console.log(`Processing recording: ${recordingId}`);
-
-    // Run CLI to convert audio to MIDI using wrapper
-    const cliResult = await drumsCLI.convert(wavPath, midiPath, {
-      sensitivity: sensitivity || 0.5,
-      threshold: threshold || 0.05,
-      bpm: bpm || 120,
-      verbose: true
+      console.log(`[PROCESS] ${id}: ${cliResult.drumCount} hits @ ${cliResult.bpm} BPM`);
+      return {
+        success: true,
+        id,
+        drumCount: cliResult.drumCount,
+        strudelPattern,
+        drumEvents,
+        // feature vectors stay on the server; the UI only needs what was heard
+        hits: cliResult.hits.map(({ time, tick, note, velocity, source }) => ({ time, tick, note, velocity, source })),
+        mode: params.mode,
+        bpm: cliResult.bpm,
+        bpmDetected: cliResult.bpmDetected,
+        quantized: cliResult.quantized,
+        midiPath: `/api/midi/${id}`
+      };
     });
+    res.json(body);
+  })
+);
 
-    if (!cliResult.success) {
-      throw new Error('CLI conversion failed');
-    }
+// ── My Kit: teach the app your own sounds ───────────────────────────────
 
-    // Upload to B2 in production
-    let storagePath = wavPath;
-    let midiStoragePath = midiPath;
-
-    if (IS_PRODUCTION && b2Client) {
-      try {
-        await b2Client.authorize();
-
-        // Upload audio
-        const audioUpload = await b2Client.uploadFile({
-          uploadUrl: process.env.B2_UPLOAD_URL,
-          uploadAuthToken: process.env.B2_UPLOAD_TOKEN,
-          fileName: `audio/${recordingId}.wav`,
-          data: fs.readFileSync(wavPath)
-        });
-        storagePath = audioUpload.fileName;
-
-        // Upload MIDI
-        const midiUpload = await b2Client.uploadFile({
-          uploadUrl: process.env.B2_UPLOAD_URL,
-          uploadAuthToken: process.env.B2_UPLOAD_TOKEN,
-          fileName: `midi/${recordingId}.mid`,
-          data: fs.readFileSync(midiPath)
-        });
-        midiStoragePath = midiUpload.fileName;
-
-        // Clean up local files in production
-        fs.unlinkSync(wavPath);
-        fs.unlinkSync(midiPath);
-      } catch (b2Error) {
-        console.error('B2 upload error:', b2Error);
-        // Fall back to local storage
-      }
-    }
-
-    // Save to database
-    const stmt = db.prepare(`
-      INSERT INTO recordings (id, filename, storage_path, midi_path, created_at, drum_count)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      recordingId,
-      req.file.originalname,
-      storagePath,
-      midiStoragePath,
-      Date.now(),
-      cliResult.drumCount || 0
-    );
-
-    res.json({
-      id: recordingId,
-      midi_url: IS_PRODUCTION
-        ? `/api/midi/${recordingId}`
-        : `/api/midi/${recordingId}`,
-      drum_count: cliResult.drumCount,
-      message: 'Recording processed successfully'
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: error.message });
-  }
+app.get('/api/kit', (req, res) => {
+  res.json({ sounds: kitStore.listSounds(KIT_PATH) });
 });
 
-// New streamlined endpoint: process audio and return Strudel pattern directly
-app.post('/api/process', upload.single('audio'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No audio file provided' });
-    }
-
-    const { sensitivity = 0.5, threshold = 0.01, bpm = 120 } = req.body;
-
-    // Validate parameters
-    const sens = parseFloat(sensitivity);
-    const thresh = parseFloat(threshold);
-    const tempo = parseInt(bpm);
-
-    if (isNaN(sens) || sens < 0 || sens > 1) {
-      return res
-        .status(400)
-        .json({ error: 'Invalid sensitivity: must be 0.0-1.0' });
-    }
-    if (isNaN(thresh) || thresh < 0 || thresh > 1) {
-      return res
-        .status(400)
-        .json({ error: 'Invalid threshold: must be 0.0-1.0' });
-    }
-    if (isNaN(tempo) || tempo < 60 || tempo > 300) {
-      return res.status(400).json({ error: 'Invalid BPM: must be 60-300' });
-    }
-
-    // Generate unique IDs
-    const recordingId = uuid();
-    const uploadedPath = req.file.path; // .webm file
-    const wavPath = path.join(UPLOAD_DIR, `${recordingId}.wav`);
-    const midiPath = path.join(MIDI_DIR, `${recordingId}.mid`);
-
-    console.log(`[PROCESS] Starting: ${recordingId}`);
-
-    // Log upload info
-    console.log(`[PROCESS] Upload received:`, {
-      filename: req.file.originalname,
-      mimetype: req.file.mimetype,
-      size: req.file.size,
-      path: uploadedPath
-    });
-
-    // Verify uploaded file exists and has content
-    const uploadStats = await fs.promises.stat(uploadedPath);
-    if (uploadStats.size < 1000) {
-      throw new Error(
-        `Audio file too small (${uploadStats.size} bytes) - recording may have failed`
-      );
-    }
-    console.log(`[PROCESS] ✓ Upload verified (${uploadStats.size} bytes)`);
-
-    // Convert WebM to WAV (BasicPitch expects 22050 Hz, mono, 16-bit PCM)
-    console.log(`[PROCESS] Converting WebM to WAV (22050 Hz, mono)...`);
-    const ffmpegCmd = `ffmpeg -y -i "${uploadedPath}" -ar 22050 -ac 1 -sample_fmt s16 "${wavPath}"`;
-
-    try {
-      const { stdout, stderr } = await execPromise(ffmpegCmd);
-      if (stderr && !stderr.includes('Duration:')) {
-        console.warn('[PROCESS] FFmpeg stderr:', stderr);
-      }
-
-      // Verify converted file exists and has content
-      const stats = await fs.promises.stat(wavPath);
-      if (stats.size === 0) {
-        throw new Error('Converted WAV file is empty');
-      }
-      if (stats.size < 1000) {
-        throw new Error(
-          `Converted WAV too small (${stats.size} bytes) - conversion may have failed`
-        );
-      }
-      console.log(`[PROCESS] ✓ Conversion successful (${stats.size} bytes)`);
-
-      // Delete original WebM
-      try {
-        await fs.promises.unlink(uploadedPath);
-      } catch (unlinkError) {
-        console.warn('Could not delete temp file:', unlinkError);
-      }
-    } catch (ffmpegError) {
-      console.error('[PROCESS] FFmpeg error:', ffmpegError);
-      console.error('  Command:', ffmpegCmd);
-      console.error('  stdout:', ffmpegError.stdout);
-      console.error('  stderr:', ffmpegError.stderr);
-      throw new Error(
-        `Audio conversion failed: ${ffmpegError.message}. Make sure FFmpeg is installed.`
-      );
-    }
-
-    // Verify CLI exists
-    if (!fs.existsSync(CLI_PATH)) {
-      throw new Error(`CLI not found at: ${CLI_PATH}`);
-    }
-    console.log(`[PROCESS] ✓ CLI found: ${CLI_PATH}`);
-
-    // Run NeuralNote CLI
-    console.log(`[PROCESS] Running NeuralNote CLI...`);
-    console.log(`  Input: ${wavPath}`);
-    console.log(`  Output: ${midiPath}`);
-    console.log(
-      `  Params: sensitivity=${sens}, threshold=${thresh}, bpm=${tempo}`
-    );
-
-    const cliResult = await drumsCLI.convert(wavPath, midiPath, {
-      sensitivity: sens,
-      threshold: thresh,
-      bpm: tempo,
-      verbose: true
-    });
-
-    if (!cliResult.success) {
-      throw new Error(
-        `CLI conversion failed: ${cliResult.output || 'Unknown error'}`
-      );
-    }
-
-    // Verify MIDI was created
-    if (!fs.existsSync(midiPath)) {
-      throw new Error(
-        'CLI completed but MIDI file was not created. Check CLI output for errors.'
-      );
-    }
-
-    const midiStats = await fs.promises.stat(midiPath);
-    if (midiStats.size === 0) {
-      throw new Error('MIDI file is empty');
-    }
-    console.log(`[PROCESS] ✓ MIDI created (${midiStats.size} bytes)`);
-
-    if (cliResult.drumCount === 0) {
-      // Cleanup and return early
-      try {
-        await fs.promises.unlink(wavPath);
-        await fs.promises.unlink(midiPath);
-      } catch (e) {
-        // Ignore cleanup errors
-      }
-      return res.json({
-        success: false,
-        drumCount: 0,
-        error:
-          'No drum hits detected. Try beatboxing louder or adjusting sensitivity.'
+// Teach one sound: a short clip of the same noise repeated, plus the drum it should trigger
+app.post(
+  '/api/kit/teach',
+  upload.single('audio'),
+  route(async (req, res) => {
+    const wavPath = path.join(UPLOAD_DIR, `${crypto.randomUUID()}.wav`);
+    const added = await thenCleanUp([wavPath, req.file?.path], async () => {
+      if (!req.file) throw httpError(400, 'No audio file provided');
+      await toWav(req.file.path, wavPath);
+      // Classic run: only the hits' features matter here, not their labels
+      const heard = await drumsCLI.convert(wavPath, null);
+      return kitStore.addSound(KIT_PATH, {
+        note: req.body.note,
+        name: req.body.name,
+        hits: heard.hits,
+        featureVersion: heard.featureVersion,
+        scales: heard.featureScales,
+        range: heard.kitRange
       });
-    }
-
-    // Parse MIDI and generate Strudel pattern SERVER-SIDE
-    console.log(`[PROCESS] Generating Strudel pattern...`);
-    const { strudelPattern, drumEvents } = await convertMidiToStrudelPattern(
-      midiPath,
-      tempo
-    );
-
-    // Cleanup temp audio file (keep MIDI for potential download)
-    try {
-      await fs.promises.unlink(wavPath);
-    } catch (e) {
-      console.warn('Could not delete temp audio:', e);
-    }
-
-    // Save to database (optional, for history)
-    try {
-      const stmt = db.prepare(`
-        INSERT INTO recordings (id, filename, storage_path, midi_path, created_at, drum_count)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      stmt.run(
-        recordingId,
-        req.file.originalname || 'beatbox.webm',
-        wavPath, // Already deleted, but store path for reference
-        midiPath,
-        Date.now(),
-        cliResult.drumCount
-      );
-    } catch (dbError) {
-      console.warn('Database save failed:', dbError);
-      // Continue anyway
-    }
-
-    console.log(
-      `[PROCESS] Complete: ${recordingId} - ${cliResult.drumCount} hits`
-    );
-
-    // Return pattern directly
-    res.json({
-      success: true,
-      drumCount: cliResult.drumCount,
-      strudelPattern,
-      drumEvents,
-      bpm: tempo,
-      midiPath: `/api/midi/${recordingId}`
     });
-  } catch (error) {
-    console.error('[PROCESS] Error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(201).json(added);
+  })
+);
+
+app.delete('/api/kit/:id', (req, res) => {
+  if (!kitStore.removeSound(KIT_PATH, req.params.id)) {
+    return res.status(404).json({ error: 'Sound not found' });
   }
+  res.json({ sounds: kitStore.listSounds(KIT_PATH) });
 });
 
 // Get MIDI file
@@ -501,7 +392,7 @@ app.get('/api/midi/:id', async (req, res) => {
       if (!fs.existsSync(midiFilePath)) {
         return res.status(404).json({ error: 'MIDI file not found' });
       }
-      res.sendFile(midiFilePath);
+      res.download(midiFilePath, 'beatbox-drums.mid');
     }
   } catch (error) {
     console.error('MIDI fetch error:', error);
@@ -509,18 +400,52 @@ app.get('/api/midi/:id', async (req, res) => {
   }
 });
 
-// List recordings
+// List recordings that can still be downloaded. Server paths stay on the server.
 app.get('/api/recordings', (req, res) => {
   try {
     const recordings = db
-      .prepare('SELECT * FROM recordings ORDER BY created_at DESC LIMIT 50')
-      .all();
+      .prepare('SELECT id, created_at, drum_count, midi_path FROM recordings ORDER BY created_at DESC LIMIT 50')
+      .all()
+      // local MIDI files can be gone (cleared folder, older builds); B2 is not checked
+      .filter((row) => (IS_PRODUCTION && b2Client) || (row.midi_path && fs.existsSync(row.midi_path)))
+      .map(({ id, created_at, drum_count }) => ({ id, created_at, drum_count }));
     res.json(recordings);
   } catch (error) {
     console.error('List recordings error:', error);
     res.status(500).json({ error: error.message });
   }
 });
+
+// Save edited hits: the same recording, its MIDI file rewritten by the CLI, a fresh preview pattern
+app.put(
+  '/api/recordings/:id/notes',
+  route(async (req, res) => {
+    const { id } = req.params;
+    const { bpm, notes } = notesParams(req.body);
+    const find = () => db.prepare('SELECT midi_path FROM recordings WHERE id = ?').get(id);
+    const recording = find();
+    if (!recording?.midi_path || !fs.existsSync(recording.midi_path)) {
+      throw httpError(404, 'Recording not found');
+    }
+
+    const scratch = path.join(UPLOAD_DIR, crypto.randomUUID());
+    const body = await thenCleanUp([`${scratch}.json`, `${scratch}.mid`], async () => {
+      await fs.promises.writeFile(`${scratch}.json`, JSON.stringify({ notes }));
+      const written = await drumsCLI.writeNotes(`${scratch}.json`, `${scratch}.mid`, bpm);
+      // Renamed into place, so a download never reads a half-written file
+      await fs.promises.rename(`${scratch}.mid`, recording.midi_path);
+      if (!find()) {
+        // deleted while the CLI ran: do not leave a file no recording points at
+        await fs.promises.rm(recording.midi_path, { force: true });
+        throw httpError(404, 'Recording not found');
+      }
+      const { strudelPattern, drumEvents } = await convertMidiToStrudelPattern(recording.midi_path, bpm);
+      db.prepare('UPDATE recordings SET drum_count = ? WHERE id = ?').run(written.drumCount, id);
+      return { success: true, id, drumCount: written.drumCount, strudelPattern, drumEvents, bpm, midiPath: `/api/midi/${id}` };
+    });
+    res.json(body);
+  })
+);
 
 // Delete recording
 app.delete('/api/recordings/:id', async (req, res) => {
@@ -577,12 +502,25 @@ if (IS_PRODUCTION) {
   });
 }
 
-app.listen(PORT, () => {
-  console.log(`🥁 Beatbox MIDI Studio`);
-  console.log(`   Mode: ${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}`);
-  console.log(`   Server: http://localhost:${PORT}`);
-  console.log(
-    `   Storage: ${IS_PRODUCTION ? 'Backblaze B2' : 'Local filesystem'}`
-  );
-  console.log(`   CLI: ${CLI_PATH}`);
+// Every failure leaves as JSON — the UI calls res.json() on error responses.
+// Must be registered after all routes.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  const status = err.status || (err instanceof multer.MulterError ? 400 : 500);
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: err.message });
 });
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`🥁 Beatbox MIDI Studio`);
+    console.log(`   Mode: ${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+    console.log(`   Server: http://localhost:${PORT}`);
+    console.log(
+      `   Storage: ${IS_PRODUCTION ? 'Backblaze B2' : 'Local filesystem'}`
+    );
+    console.log(`   CLI: ${CLI_PATH}`);
+  });
+}
+
+module.exports = app;

@@ -31,12 +31,12 @@ NeuralNote comes as a simple AudioFX plugin (VST3/AU/Standalone app) to be appli
 The workflow is very simple:
 
 - Gather some audio
-    - Click record. Works when recording for real or when playing the track in a DAW.
-    - Or drop an audio file on the plugin. (.wav, .aiff, .flac, .mp3 and .ogg (vorbis) supported)
+  - Click record. Works when recording for real or when playing the track in a DAW.
+  - Or drop an audio file on the plugin. (.wav, .aiff, .flac, .mp3 and .ogg (vorbis) supported)
 - The MIDI transcription instantly appears in the piano roll section.
 - Listen to the result by clicking the play button.
-    - Play with the different settings to adjust the transcription, even while listening to it
-    - Individually adjust the level of the source audio and of the synthesized transcription
+  - Play with the different settings to adjust the transcription, even while listening to it
+  - Individually adjust the level of the source audio and of the synthesized transcription
 - Once you're satisfied, export the MIDI transcription with a simple drag and drop from the plugin to a MIDI track.
 
 **Watch our presentation video for the Neural Audio Plugin
@@ -59,7 +59,7 @@ Use this when cloning:
 
 ```
 git clone --recurse-submodules --shallow-submodules https://github.com/DamRsn/NeuralNote
- ```
+```
 
 The following OS-specific build scripts have to be executed at least once before being able to use the project as a
 normal CMake project. The script downloads onnxruntime static library (that we created
@@ -170,6 +170,7 @@ Many thanks to the contributors!
 
 - [jatinchowdhury18](https://github.com/jatinchowdhury18): File browser.
 - [trirpi](https://github.com/trirpi)
-    - More scale options in `SCALE QUANTIZE`.
-    - Horizontal zoom for the audio waveform and the piano roll.
-- [polygon](https://github.com/polygon) and [SamuMazzi](https://github.com/SamuMazzi): Linux support.
+  - More scale options in `SCALE QUANTIZE`.
+  - Horizontal zoom for the audio waveform and the piano roll.
+
+claude --resume df0ab833-b337-4c28-9102-72bec428d6b1

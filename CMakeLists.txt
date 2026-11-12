@@ -350,6 +350,7 @@ if(BUILD_CLI)
             juce::juce_audio_formats
             juce::juce_events
             juce::juce_graphics
+            juce::juce_dsp
             onnxruntime
             bin_data
             BasicPitchCNN

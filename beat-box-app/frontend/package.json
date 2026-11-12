@@ -2,20 +2,19 @@
   "name": "beat-box-app-frontend",
   "version": "1.0.0",
   "type": "module",
-  "description": "Frontend for Beat Box App - React + shadcn/ui",
+  "description": "Frontend for Beat Box App - React + Tailwind",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test",
+    "test:browser": "node browser-check.mjs"
   },
   "dependencies": {
-    "@strudel/repl": "^1.2.7",
     "@strudel/web": "^1.2.6",
-    "clsx": "^2.0.0",
-    "midi-parser-js": "^4.0.4",
+    "lucide-react": "^1.72.0",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "tailwind-merge": "^2.2.0"
+    "react-dom": "^18.2.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.43",

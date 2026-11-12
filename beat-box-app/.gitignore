@@ -1,0 +1,7 @@
+node_modules/
+frontend/dist/
+*.db
+backend/data/
+backend/midi/
+training/data/
+__pycache__/

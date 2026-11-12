@@ -1,285 +1,174 @@
-#!/usr/bin/env node
-
 /**
- * Node.js wrapper for NeuralNote Drums CLI
- * Provides JavaScript API for beatboxing-to-MIDI conversion
+ * Node.js wrapper for the neuralnote_drums CLI (beatbox audio -> GM drum MIDI).
+ * The CLI owns all audio logic; this only builds flags and parses its --json result.
  */
 
-const { spawn } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
-class DrumsCLI {
-  constructor(cliPath = path.join(__dirname, '../CLI/neuralnote_drums')) {
-    // Resolve to absolute path
-    this.cliPath = path.resolve(cliPath);
+/**
+ * @typedef {Object} DrumHit
+ * @property {number} time - Onset in seconds from the start of the audio
+ * @property {number} tick - MIDI tick (480 PPQ) the hit was written at
+ * @property {number} note - General MIDI drum note
+ * @property {number} velocity - MIDI velocity 1-127
+ * @property {'classic'|'kit'|'neural'|'edit'} source - which classifier chose the note ('edit': the user did)
+ * @property {number} [distance] - kit mode: distance to the nearest taught sound
+ * @property {number[]} features - feature vector (layout = featureVersion)
+ */
 
-    // Verify CLI exists
+/**
+ * @typedef {Object} ConvertResult
+ * @property {boolean} success
+ * @property {number} drumCount - Number of detected hits (0 means no MIDI file was written)
+ * @property {number} bpm - Tempo written into the MIDI file
+ * @property {boolean} bpmDetected - Tempo was estimated from the audio and passed the confidence gate
+ * @property {boolean} quantized - Hits were snapped to the 1/16 grid
+ * @property {DrumHit[]} hits
+ * @property {number} featureVersion - layout of hit.features
+ * @property {number[]} featureScales - per-feature spread used to compare sounds (0 = ignored)
+ * @property {number} kitRange - distance within which a hit matches a taught sound
+ * @property {string|null} outputPath
+ * @property {number} fileSize - MIDI size in bytes, 0 when none was written
+ * @property {string} log - CLI stderr (verbose log)
+ */
+
+class DrumsCLI {
+  /** @param {string} [cliPath] - Path to the neuralnote_drums executable */
+  constructor(cliPath = path.join(__dirname, '../cli/neuralnote_drums')) {
+    this.cliPath = path.resolve(cliPath);
     if (!fs.existsSync(this.cliPath)) {
       throw new Error(`CLI not found at: ${this.cliPath}`);
     }
   }
 
   /**
-   * Convert audio file to MIDI drums
-   * @param {string} inputPath - Path to audio file (.wav, .mp3)
-   * @param {string} outputPath - Path for output MIDI file
-   * @param {Object} options - Processing options
-   * @returns {Promise<Object>} Result with drum count and output
+   * Convert an audio file to MIDI drums.
+   * @param {string} inputPath - WAV/AIFF/FLAC file
+   * @param {string|null} outputPath - MIDI path, or null to analyse without writing
+   * @param {Object} [options]
+   * @param {number} [options.sensitivity=0.5] - 0-1, higher detects more hits
+   * @param {number} [options.threshold=0] - 0-1 amplitude floor, 0 = adaptive
+   * @param {number|'auto'} [options.bpm=120] - 60-300, or 'auto' to detect the tempo
+   * @param {0|16} [options.quantize=0] - 16 snaps hits to 1/16 notes (only when the tempo is known)
+   * @param {'classic'|'kit'|'neural'} [options.mode='classic'] - kit matches hits to taught sounds first
+   * @param {string} [options.kitPath] - kit JSON, required for mode 'kit'
+   * @param {string} [options.modelPath] - trained network JSON for mode 'neural' (default: beside the CLI)
+   * @param {number} [options.kitRange] - override the CLI's default matching range
+   * @param {boolean} [options.verbose=false] - Echo the CLI log to the console
+   * @returns {Promise<ConvertResult>}
    */
-  async convert(inputPath, outputPath, options = {}) {
-    return new Promise((resolve, reject) => {
-      const {
-        sensitivity = 0.5,
-        threshold = 0.01,
-        bpm = 120,
-        verbose = false
-      } = options;
+  convert(inputPath, outputPath, options = {}) {
+    const { sensitivity = 0.5, threshold = 0, bpm = 120, quantize = 0, mode = 'classic', kitPath, kitRange, modelPath, verbose = false } = options;
 
-      // Validate input file exists
+    return new Promise((resolve, reject) => {
       if (!fs.existsSync(inputPath)) {
         return reject(new Error(`Input file not found: ${inputPath}`));
       }
-
-      // Validate parameters
-      if (sensitivity < 0 || sensitivity > 1) {
+      if (!(sensitivity >= 0 && sensitivity <= 1)) {
         return reject(new Error('Sensitivity must be between 0.0 and 1.0'));
       }
-      if (threshold < 0 || threshold > 1) {
+      if (!(threshold >= 0 && threshold <= 1)) {
         return reject(new Error('Threshold must be between 0.0 and 1.0'));
       }
-      if (bpm < 60 || bpm > 300) {
-        return reject(new Error('BPM must be between 60 and 300'));
+      if (bpm !== 'auto' && !(bpm >= 60 && bpm <= 300)) {
+        return reject(new Error("BPM must be between 60 and 300, or 'auto'"));
+      }
+      if (quantize !== 0 && quantize !== 16) {
+        return reject(new Error('Quantize must be 0 or 16'));
       }
 
-      // Build CLI arguments
       const args = [
-        '-i',
-        inputPath,
-        '-o',
-        outputPath,
-        '-s',
-        sensitivity.toString(),
-        '-t',
-        threshold.toString(),
-        '--bpm',
-        bpm.toString()
+        '-i', inputPath, '--json',
+        '-s', String(sensitivity), '-t', String(threshold),
+        '--bpm', String(bpm), '--quantize', String(quantize)
       ];
+      if (mode !== 'classic') args.push('--mode', mode);
+      if (kitPath) args.push('--kit', kitPath);
+      if (modelPath) args.push('--model', modelPath);
+      if (kitRange !== undefined) args.push('--kit-range', String(kitRange));
+      if (outputPath) args.push('-o', outputPath);
+      if (verbose) args.push('-v');
 
-      if (verbose) {
-        args.push('-v');
-      }
-
-      // Spawn CLI process
-      const child = spawn(this.cliPath, args);
-
-      let stdout = '';
-      let stderr = '';
-
-      child.stdout.on('data', (data) => {
-        stdout += data.toString();
-        if (verbose) {
-          console.log(data.toString());
-        }
-      });
-
-      child.stderr.on('data', (data) => {
-        stderr += data.toString();
-        if (verbose) {
-          console.error(data.toString());
-        }
-      });
-
-      child.on('close', (code) => {
-        if (code === 0) {
-          // Parse drum count from output
-          const match = stdout.match(/Saved (\d+) drum hits/);
-          const drumCount = match ? parseInt(match[1]) : 0;
-
-          // Verify output file was created
-          if (!fs.existsSync(outputPath)) {
-            return reject(new Error('Output MIDI file was not created'));
-          }
-
-          resolve({
-            success: true,
-            drumCount,
-            outputPath,
-            output: stdout,
-            fileSize: fs.statSync(outputPath).size
-          });
-        } else {
-          reject(
-            new Error(`CLI failed with code ${code}: ${stderr || stdout}`)
-          );
-        }
-      });
-
-      child.on('error', (err) => {
-        reject(new Error(`Failed to spawn CLI: ${err.message}`));
-      });
+      this.#run(args, outputPath, verbose).then(resolve, reject);
     });
   }
 
   /**
-   * Batch convert multiple files
-   * @param {Array<Object>} files - Array of {input, output, options}
-   * @returns {Promise<Array>} Results for each file
+   * Write a MIDI file from hits the user edited: no audio, no detection.
+   * @param {string} notesPath - JSON file: {"notes":[{tick, note, velocity}]}, ticks at 480 PPQ
+   * @param {string} outputPath - MIDI path
+   * @param {number} bpm - 60-300, the tempo the ticks are counted in
+   * @returns {Promise<ConvertResult>}
    */
-  async convertBatch(files) {
-    const results = [];
-
-    for (const file of files) {
-      try {
-        const result = await this.convert(
-          file.input,
-          file.output,
-          file.options
-        );
-        results.push({ ...result, inputPath: file.input });
-      } catch (error) {
-        results.push({
-          success: false,
-          inputPath: file.input,
-          error: error.message
-        });
-      }
-    }
-
-    return results;
+  writeNotes(notesPath, outputPath, bpm) {
+    return this.#run(['--notes', notesPath, '-o', outputPath, '--bpm', String(bpm), '--json'], outputPath);
   }
 
   /**
-   * Get CLI version/info
-   * @returns {Promise<Object>} CLI information
+   * Run the CLI and parse its one JSON result.
+   * @param {string[]} args
+   * @param {string|null} outputPath - MIDI path the run should have written, if any
+   * @param {boolean} [verbose]
+   * @returns {Promise<ConvertResult>}
    */
-  async getInfo() {
+  #run(args, outputPath, verbose = false) {
     return new Promise((resolve, reject) => {
-      const child = spawn(this.cliPath, ['--help']);
-      let output = '';
-
-      child.stdout.on('data', (data) => {
-        output += data.toString();
-      });
-
-      child.stderr.on('data', (data) => {
-        output += data.toString();
-      });
-
-      child.on('close', (code) => {
-        if (code === 0 || code === 1) {
-          // --help returns 1
-          resolve({
-            available: true,
-            cliPath: this.cliPath,
-            help: output
-          });
-        } else {
-          reject(new Error('Failed to get CLI info'));
+      // No grandchildren, so SIGKILL at the timer always ends in this callback.
+      execFile(this.cliPath, args, { maxBuffer: 32 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' }, (err, stdout, stderr) => {
+        if (verbose && stderr) console.error(stderr);
+        if (err?.killed) {
+          return reject(Object.assign(new Error('Finding the hits took too long. Try a shorter clip.'), { status: 504 }));
         }
-      });
+        if (err) {
+          return reject(new Error(`CLI failed: ${(stderr || err.message).trim()}`));
+        }
 
-      child.on('error', (err) => {
-        reject(new Error(`CLI not accessible: ${err.message}`));
+        let result;
+        try {
+          result = JSON.parse(stdout);
+        } catch {
+          // Binaries built before --json existed print log text here instead.
+          return reject(new Error('CLI output is not JSON — the neuralnote_drums binary is stale. Rebuild it: ./build.sh'));
+        }
+
+        const drumCount = result.hits.length;
+        const wroteMidi = Boolean(outputPath) && drumCount > 0;
+        if (wroteMidi && !fs.existsSync(outputPath)) {
+          return reject(new Error('Output MIDI file was not created'));
+        }
+
+        resolve({
+          success: true,
+          drumCount,
+          bpm: result.bpm,
+          bpmDetected: result.bpmDetected,
+          quantized: result.quantized,
+          hits: result.hits,
+          featureVersion: result.featureVersion,
+          featureScales: result.featureScales,
+          kitRange: result.kitRange,
+          outputPath: wroteMidi ? outputPath : null,
+          fileSize: wroteMidi ? fs.statSync(outputPath).size : 0,
+          log: stderr
+        });
+      });
+    });
+  }
+
+  /**
+   * Check the executable runs.
+   * @returns {Promise<{available: boolean, cliPath: string}>}
+   */
+  getInfo() {
+    return new Promise((resolve, reject) => {
+      execFile(this.cliPath, ['--help'], (err) => {
+        if (err) return reject(new Error(`CLI not accessible: ${err.message}`));
+        resolve({ available: true, cliPath: this.cliPath });
       });
     });
   }
 }
 
-// CLI usage when run directly
-if (require.main === module) {
-  const args = process.argv.slice(2);
-
-  if (args.length < 4 || args.includes('--help') || args.includes('-h')) {
-    console.log(`
-NeuralNote Drums CLI - Node.js Wrapper
-
-Usage:
-  node drums-cli-wrapper.js -i <input> -o <output> [options]
-
-Options:
-  -i, --input <file>      Input audio file
-  -o, --output <file>     Output MIDI file
-  -s, --sensitivity <val> Sensitivity 0.0-1.0 (default: 0.5)
-  -t, --threshold <val>   Threshold 0.0-1.0 (default: 0.01)
-  --bpm <value>           BPM (default: 120)
-  -v, --verbose           Verbose output
-  --cli-path <path>       Path to CLI executable
-
-Example:
-  node drums-cli-wrapper.js -i beatbox.wav -o drums.mid -s 0.2 -v
-    `);
-    process.exit(args.includes('--help') || args.includes('-h') ? 0 : 1);
-  }
-
-  // Parse arguments
-  const options = {
-    input: null,
-    output: null,
-    sensitivity: 0.5,
-    threshold: 0.01,
-    bpm: 120,
-    verbose: false,
-    cliPath: path.join(__dirname, '../build/CLI/neuralnote_drums')
-  };
-
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case '-i':
-      case '--input':
-        options.input = args[++i];
-        break;
-      case '-o':
-      case '--output':
-        options.output = args[++i];
-        break;
-      case '-s':
-      case '--sensitivity':
-        options.sensitivity = parseFloat(args[++i]);
-        break;
-      case '-t':
-      case '--threshold':
-        options.threshold = parseFloat(args[++i]);
-        break;
-      case '--bpm':
-        options.bpm = parseInt(args[++i]);
-        break;
-      case '-v':
-      case '--verbose':
-        options.verbose = true;
-        break;
-      case '--cli-path':
-        options.cliPath = args[++i];
-        break;
-    }
-  }
-
-  if (!options.input || !options.output) {
-    console.error('Error: Input and output files are required');
-    process.exit(1);
-  }
-
-  // Run conversion
-  (async () => {
-    try {
-      const cli = new DrumsCLI(options.cliPath);
-      const result = await cli.convert(options.input, options.output, {
-        sensitivity: options.sensitivity,
-        threshold: options.threshold,
-        bpm: options.bpm,
-        verbose: options.verbose
-      });
-
-      console.log('\n✅ Conversion successful!');
-      console.log(`   Drum hits: ${result.drumCount}`);
-      console.log(`   Output: ${result.outputPath} (${result.fileSize} bytes)`);
-      process.exit(0);
-    } catch (error) {
-      console.error('\n❌ Conversion failed:', error.message);
-      process.exit(1);
-    }
-  })();
-}
-
-// Export for use as module
 module.exports = DrumsCLI;

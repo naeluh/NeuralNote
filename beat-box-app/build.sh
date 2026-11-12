@@ -8,12 +8,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Go up one level from beat-box-app/ to NeuralNote root
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLI_DIR="$SCRIPT_DIR/cli"
-BUILD_DIR="$SCRIPT_DIR"
 
 echo "🥁 Building NeuralNote Drums CLI..."
 echo "Project root: $PROJECT_ROOT"
 echo "CLI source: $CLI_DIR"
-echo "Build output: $BUILD_DIR/CLI"
+echo "Build output: $CLI_DIR/neuralnote_drums"
 
 # Ensure we're in the project root for the main build
 cd "$PROJECT_ROOT"
@@ -25,9 +24,6 @@ if [ ! -d "$PROJECT_ROOT/build" ]; then
     ./build.sh
     cd "$SCRIPT_DIR"
 fi
-
-# Create build directory for CLI if it doesn't exist
-mkdir -p "$BUILD_DIR/CLI"
 
 # Verify source file exists (use absolute path)
 SOURCE_FILE="$CLI_DIR/neuralnote_drums_cli.cpp"
@@ -69,18 +65,16 @@ if ! cmake --build build --target neuralnote_drums_cli -j $(getconf _NPROCESSORS
 fi
 cd "$SCRIPT_DIR"
 
-# Copy to beat-box-app build directory
+# Copy binary next to its source: backend/server.js runs beat-box-app/cli/neuralnote_drums
 if [ -f "$PROJECT_ROOT/build/CLI/neuralnote_drums" ]; then
-    mkdir -p "$BUILD_DIR/CLI"
-    cp "$PROJECT_ROOT/build/CLI/neuralnote_drums" "$BUILD_DIR/CLI/neuralnote_drums"
-    chmod +x "$BUILD_DIR/CLI/neuralnote_drums"
-    echo "✅ Success! Executable: $BUILD_DIR/CLI/neuralnote_drums"
+    cp "$PROJECT_ROOT/build/CLI/neuralnote_drums" "$CLI_DIR/neuralnote_drums"
+    chmod +x "$CLI_DIR/neuralnote_drums"
+    echo "✅ Success! Executable: $CLI_DIR/neuralnote_drums"
     echo ""
     echo "Usage:"
-    echo "  $BUILD_DIR/CLI/neuralnote_drums -i beatbox.wav -o drums.mid -v"
+    echo "  $CLI_DIR/neuralnote_drums -i beatbox.wav -o drums.mid -v"
 else
     echo "❌ Build failed - executable not found at: $PROJECT_ROOT/build/CLI/neuralnote_drums"
     echo "   Make sure the main project build completed successfully."
     exit 1
 fi
-
