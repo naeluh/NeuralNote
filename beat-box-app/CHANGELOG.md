@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-11-11 — playhead fixed, whole beat in view, zoom, drag to scroll, any tempo
+
+Reported: the playhead was off and never reached the end of the beat, the
+timeline needed a scroll bar, and the tempo could not be set freely.
+Nothing changed on the server or in the CLI.
+
+### Fixed
+
+- **Playhead walked only part of the beat.** The preview code sets its speed
+  with `.cpm()`, which stretches the pattern and leaves the player's clock at
+  0.5 cycles a second, so the line wrapped every 2 seconds whatever the loop
+  length. `playheadStep()` now takes time played at the beat's tempo, wrapped
+  at `loopSteps()` (kept hits padded to whole bars, the server's rule).
+- A preview answer the grid has already moved past is no longer played.
+
+### Added
+
+- **Tempo box** beside Play: any BPM from 60 to 300, an edit like the others
+  (saved to the `.mid`, one Undo per run, locks Fine-tune until Reset edits).
+  With the box focused the **wheel** changes it, and the player's clock is
+  nudged at once (`scheduler.setCps`), so the change is heard without a jump.
+- **Zoom slider** in the corner of the track area (1× to 4×).
+- **Drag empty timeline space with the mouse to scroll** when zoomed in.
+
+### Changed
+
+- **The whole beat is in view** at 1× (was 24px a step, scrolling from the
+  third bar on). Phones keep 24px steps so a finger can hit them.
+- **No scroll bar** on the timeline.
+- The bar.beat readout in the corner is gone: ruler and playhead say it.
+- Tests: browser 86 → 93 (playhead reaches the end, beat fits, drag scrolls
+  and adds no hit, no scroll bar, tempo wheel needs focus / is shown / is
+  saved once / is undone).
+
 ## 2026-11-11 — the beat as a timeline: ruler, playhead, a header per row
 
 Reported: editing was hard, the drum pickers sat in a bar above the grid away

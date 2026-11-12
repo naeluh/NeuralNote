@@ -26,3 +26,6 @@ Makefile
 onnxruntime*.tar.gz
 ThirdParty/onnxruntime
 /Installers/Windows/Output/
+
+.cursor
+.claude

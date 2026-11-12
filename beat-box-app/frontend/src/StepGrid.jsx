@@ -355,9 +355,10 @@ export function StepGrid({ grid, busy = false, disabled = false, trim = null, pl
         </div>
       </div>
 
+      {/* overflow-x-clip: the end trim handle's 44px touch area would otherwise stick out and make 14px to scroll */}
       {/* the timeline: the whole beat in view; zoomed in (or on a phone) it scrolls sideways, by drag, with no scroll bar */}
       <div ref={scrollRef} data-testid='timeline' className='min-w-0 flex-1 select-none overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden'>
-        <div className='relative min-w-[var(--tap)] space-y-1 sm:min-w-0' style={{ width: `${zoom * 100}%`, '--tap': `${steps * CELL_MIN + 2 * INSET}px` }}>
+        <div className='relative min-w-[var(--tap)] space-y-1 overflow-x-clip sm:min-w-0' style={{ width: `${zoom * 100}%`, '--tap': `${steps * CELL_MIN + 2 * INSET}px` }}>
           {/* trim on the ruler: the hits between the handles are the file; nothing is listened to again */}
           <TrimRange
             label='Trim your beat'

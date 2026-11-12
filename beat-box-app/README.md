@@ -75,6 +75,8 @@ The grid is the beat: what it shows is what the `.mid` holds and what Play plays
   **Alt + Arrow**. Arrow keys alone walk the cells; Enter or Space toggles.
   Moving a hit to another step puts it on the grid line; moving it only to
   another drum keeps its played timing.
+- **Zoom**: the slider in the corner of the track area. At 1× the whole beat is in view (on a phone steps stay 24px wide and it scrolls); zoomed in, drag empty space with the mouse, or swipe, to move along it.
+- **Tempo**: the box beside Play takes any BPM from 60 to 300. Click it and turn the wheel to speed up or slow down while it plays. It is an edit: saved into the `.mid`, undone with Undo, and it locks Fine-tune until Reset edits.
 - **Change a drum**: the drum picker sits at the start of its own row, next
   to the row's icon (the same list as My Kit). Pick another drum and the whole
   row plays it. **Add drum**, under the last row, adds an empty row to tap
@@ -253,7 +255,7 @@ regenerate the baseline and say so in the changelog.
 edit sends to the server, playhead position, waveform peaks, mode fallback,
 half/double tempo).
 
-**Browser** — `frontend/browser-check.mjs`, 86 checks. It starts its own
+**Browser** — `frontend/browser-check.mjs`, 93 checks. It starts its own
 server on a scratch port with a scratch data dir, opens the built app in
 headless Chrome with a fake microphone, and walks the whole flow: record,
 level strip, timeline (one line per drum, icons, ruler, playhead), tap / drag /
@@ -301,7 +303,8 @@ component classes live in `frontend/src/index.css`):
 ## Known gaps
 
 - The playhead cannot be dragged and the ruler cannot be clicked to play from there: the preview always loops from the trim start. No playhead on the waveform, and no way to hear the trimmed audio itself.
-- The timeline follows the playhead only while the pointer and keyboard focus are outside the grid, and it does not scroll by itself while a hit is dragged past its edge (scroll first, or use Alt + Arrow). No zoom.
+- The timeline follows the playhead only while the pointer and keyboard focus are outside the grid, and it does not scroll by itself while a hit is dragged past its edge (scroll first, or use Alt + Arrow). The timeline has no scroll bar: it moves by mouse drag, touch, or the playhead.
+- A tempo typed into the preview code makes the playhead drift (it assumes the tempo in the tempo box). The tempo box changes speed only; hits stay on their steps.
 - Row icons come from lucide, which has one drum: the toms share a cylinder and the cymbals are discs.
 - Hand edits: no per-hit loudness, no adding bars (the grid is as long as what was detected), and a past recording cannot be edited (its hits and audio are not kept).
 - The `.mid` still ends at the bar line after its last hit, so empty bars at the end of a trim are not kept.

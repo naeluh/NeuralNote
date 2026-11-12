@@ -366,16 +366,44 @@ try {
     const resting = () => p.waitFor(`${PLAYHEAD}.hidden`, 2000);
     if (await p.waitFor(`!${PLAYHEAD}.hidden`, 8000)) {
       const left = () => p.evaluate(`parseFloat(${PLAYHEAD}.style.left)`);
-      const a = await left();
-      await sleep(250);
-      const b = await left();
-      check('playhead: moves along the timeline while the preview plays', a !== b && b >= 0 && b <= 100, `${a.toFixed(1)}% then ${b.toFixed(1)}%`);
+      // follow it until it wraps: it has to walk the whole loop, not a part of it
+      let furthest = await left();
+      for (let i = 0, now = furthest; i < 150 && now >= furthest; i++) {
+        furthest = now;
+        await sleep(80);
+        now = await left();
+      }
+      check('playhead: walks to the end of the beat before it loops', furthest > 90 && furthest <= 100, `turned back at ${furthest.toFixed(1)}%`);
       await p.click('Stop');
       check('playhead: gone when the preview stops', await resting());
     } else {
       console.log('  --  playhead checks skipped: the preview did not start (no network for its samples?)');
       check('timeline: stopped, there is no playhead', await resting());
     }
+
+    // ── the whole beat in view; zoom in and drag to move along it ──
+    const TIMELINE = `document.querySelector('[data-testid="timeline"]')`;
+    const hitsBefore = await p.hits();
+    check('timeline: the whole beat is in view, nothing to scroll', await p.evaluate(`${TIMELINE}.scrollWidth <= ${TIMELINE}.clientWidth + 1`), await p.evaluate(`${TIMELINE}.scrollWidth + ' in ' + ${TIMELINE}.clientWidth`));
+    const setZoom = (value) =>
+      p.evaluate(`(() => {
+        const el = document.querySelector('input[aria-label="Zoom the timeline"]');
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, '${value}');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      })()`);
+    await setZoom(2);
+    await sleep(200);
+    const grab = await p.cellPoint(await p.freeRun());
+    await p.evaluate(`${TIMELINE}.scrollLeft = 200`);
+    await p.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: grab.x, y: grab.y, button: 'left', clickCount: 1 });
+    for (const dx of [40, 80, 120]) await p.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: grab.x + dx, y: grab.y, button: 'left', buttons: 1 });
+    await p.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: grab.x + 120, y: grab.y, button: 'left', clickCount: 1 });
+    await sleep(200);
+    const panned = await p.evaluate(`${TIMELINE}.scrollLeft`);
+    check('zoom: a mouse drag on empty space scrolls the timeline and adds no hit', Math.abs(panned - 80) < 3 && (await p.hits()) === hitsBefore, `scrollLeft 200 -> ${panned}`);
+    check('zoom: no scroll bar takes up room', await p.evaluate(`${TIMELINE}.offsetHeight === ${TIMELINE}.clientHeight`));
+    await setZoom(1);
+    await sleep(200);
 
     // ── edit by hand: the grid is the beat ──
     const download = async () => Buffer.from(await (await fetch(base + (await p.midi()))).arrayBuffer());
@@ -481,6 +509,29 @@ try {
     check('reset: listens again, hand edits gone, detection open', p.conversions() === before + 1 && (await p.hits()) === hits0 && (await p.rows()).length === rows0 && (await p.locate('Classic')).disabled === false, await p.headline());
     check('reset: the edited file is replaced', (await status(firstMidi)) === 404 && (await p.midi()) !== firstMidi);
     firstMidi = await p.midi();
+
+    // ── any tempo, by wheel on the tempo box ──
+    const tempo = () => p.evaluate(`Number(document.querySelector('#tempo').value)`);
+    const tempo0 = await tempo();
+    const codeAtTempo0 = await p.code();
+    const savesAtTempo0 = p.saves();
+    const boxPoint = () => p.evaluate(`(() => { const el = document.querySelector('#tempo'); el.scrollIntoView({ block: 'center' }); const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    let box = await boxPoint();
+    await p.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: box.x, y: box.y, deltaX: 0, deltaY: -90 });
+    await sleep(200);
+    check('tempo: the wheel leaves it alone until the box has focus', (await tempo()) === tempo0);
+    await p.evaluate(`document.querySelector('#tempo').focus()`);
+    box = await boxPoint(); // the unfocused wheel scrolled the page, as it should
+    await p.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: box.x, y: box.y, deltaX: 0, deltaY: -90 });
+    await sleep(200);
+    check('tempo: wheel up on the focused box is faster, shown at once', (await tempo()) > tempo0 && (await p.headline()).includes(`${await tempo()} BPM`), await p.headline());
+    await p.saved();
+    check('tempo: one save for the whole turn of the wheel, and the preview code follows', p.saves() === savesAtTempo0 + 1 && (await p.code()) !== codeAtTempo0, `${p.saves() - savesAtTempo0} saves`);
+    await p.evaluate(`document.activeElement.blur()`);
+    await p.press('z', { ctrl: true });
+    await sleep(200);
+    await p.saved();
+    check('tempo: Ctrl+Z brings the old tempo back and opens detection again', (await tempo()) === tempo0 && (await p.code()) === codeAtTempo0 && (await p.locate('Classic')).disabled === false);
 
     // a tweak converts again and replaces the stored file
     before = p.conversions();
